@@ -1,0 +1,10 @@
+data
+.venv
+__pycache__
+tests
+examples
+deploy
+*.command
+*.zip
+work
+*.log

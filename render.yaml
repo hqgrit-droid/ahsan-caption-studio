@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: ahsan-caption-studio
+    runtime: docker
+    plan: free
+    envVars:
+      - key: CAPTION_SITE_USER
+        sync: false
+      - key: CAPTION_SITE_PASSWORD
+        sync: false
+      - key: HF_S3_NAMESPACE
+        sync: false
+      - key: HF_S3_BUCKET
+        sync: false
+      - key: HF_S3_ACCESS_KEY
+        sync: false
+      - key: HF_S3_SECRET_KEY
+        sync: false
