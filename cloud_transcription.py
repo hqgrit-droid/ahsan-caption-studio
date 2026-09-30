@@ -1,10 +1,10 @@
 """Optional Gemini audio transcription. Only sends audio when explicitly selected."""
-import base64,json,math,re,subprocess,tempfile
+import base64,json,math,re,subprocess,tempfile,time
 from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError,URLError
 from core import captions
-MODEL='gemini-3.8-flash'
+MODEL='gemini-3.6-flash'
 SCHEMA={'type':'OBJECT','properties':{'segments':{'type':'ARRAY','items':{'type':'OBJECT','properties':{'start':{'type':'NUMBER'},'end':{'type':'NUMBER'},'text':{'type':'STRING'}},'required':['start','end','text']}}},'required':['segments']}
 
 def parse_response(raw,duration,offset=0,roman=True):
@@ -36,13 +36,18 @@ Return short caption segments, ideally 3-7 words each. Start/end must be decimal
 Spelling reference only, never add words just because they appear here: {json.dumps(spellings,ensure_ascii=False)}'''
     payload={'contents':[{'role':'user','parts':[{'text':prompt},{'inlineData':{'mimeType':'audio/wav','data':base64.b64encode(audio).decode()}}]}], 'generationConfig':{'responseMimeType':'application/json','responseSchema':SCHEMA,'maxOutputTokens':16000}}
     req=Request(f'https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','x-goog-api-key':key})
-    try:
-        with urlopen(req,timeout=180) as response:raw=json.load(response)
-    except HTTPError as e:
-        messages={400:'Gemini rejected the request. Check your API key and model access.',401:'Invalid Gemini API key.',403:'Gemini access denied. Check key permissions and regional availability.',404:'Gemini model unavailable. Update the configured model.',429:'Gemini free quota/rate limit reached. Wait and retry, or use Local Whisper. No paid fallback was attempted.'}
-        raise ValueError(messages.get(e.code,f'Gemini service error ({e.code}). Retry later.')) from None
-    except (URLError,TimeoutError,OSError):raise ValueError('Cannot reach Gemini. Check internet access and retry.') from None
-    except ValueError:raise ValueError('Gemini returned an unreadable response.') from None
+    for attempt in range(3):
+        try:
+            with urlopen(req,timeout=180) as response:raw=json.load(response)
+            break
+        except HTTPError as e:
+            if e.code==503 and attempt<2:
+                time.sleep(2*(attempt+1))
+                continue
+            messages={400:'Gemini rejected the request. Check your API key and model access.',401:'Invalid Gemini API key.',403:'Gemini access denied. Check key permissions and regional availability.',404:'Gemini model unavailable. Update the configured model.',429:'Gemini free quota/rate limit reached. Wait and retry, or use Local Whisper. No paid fallback was attempted.',503:'Gemini is temporarily unavailable. Wait a few minutes and try again; existing captions are unchanged.'}
+            raise ValueError(messages.get(e.code,f'Gemini service error ({e.code}). Retry later.')) from None
+        except (URLError,TimeoutError,OSError):raise ValueError('Cannot reach Gemini. Check internet access and retry.') from None
+        except ValueError:raise ValueError('Gemini returned an unreadable response.') from None
     return parse_response(raw,duration,roman=roman)
 
 def transcribe_cloud(media,ffmpeg,key,duration,language,update,spellings=None):

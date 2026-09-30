@@ -10,6 +10,7 @@ from fusion_import import import_fusion
 from cloud_transcription import transcribe_cloud, MODEL as CLOUD_MODEL
 from roman_urdu import romanize_captions, validate_spellings
 from cloud_store import CloudStore, configured as cloud_configured
+from fonts import system_font_families, font_family_from_file
 
 ROOT=Path(__file__).resolve().parent
 DATA=Path(os.environ.get('CAPTION_DATA',str(ROOT/'data'))).resolve()
@@ -26,7 +27,41 @@ if STORE:
 os.environ.setdefault('HF_HOME',str(DATA/'models'/'hub-cache'))
 os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY','1')
 os.environ.setdefault('HF_HUB_DISABLE_XET','1')
-CLOUD_KEY=os.environ.get("GEMINI_API_KEY", "")
+KEY_FILE=DATA/'.gemini-api-key'
+SHARE_FILE=DATA/'.share-session.json'
+def share_session():
+    if STORE or not SHARE_FILE.exists(): return None
+    try:
+        session=json.loads(SHARE_FILE.read_text())
+        host=session.get('host','')
+        if (re.fullmatch(r'[a-z0-9-]+\.trycloudflare\.com',host)
+                and session.get('username') and session.get('password')):
+            return session
+    except (OSError,ValueError,TypeError): pass
+    return None
+
+def load_cloud_key():
+    if os.environ.get('GEMINI_API_KEY'): return os.environ['GEMINI_API_KEY']
+    return KEY_FILE.read_text().strip() if not STORE and KEY_FILE.exists() else ''
+
+def save_cloud_key(key):
+    global CLOUD_KEY
+    if not isinstance(key,str) or len(key)>256 or any(c.isspace() for c in key):
+        raise ValueError('Invalid API key format.')
+    if not STORE:
+        if key:
+            tmp=KEY_FILE.with_name(KEY_FILE.name+'.'+secrets.token_hex(8)+'.tmp')
+            try:
+                fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                with os.fdopen(fd,'w') as output: output.write(key)
+                os.replace(tmp,KEY_FILE)
+            finally:
+                tmp.unlink(missing_ok=True)
+        else: KEY_FILE.unlink(missing_ok=True)
+    CLOUD_KEY=key
+    return bool(key)
+
+CLOUD_KEY=load_cloud_key()
 LOCK=threading.RLock(); JOBS={}; TOKEN=secrets.token_hex(24)
 FFMPEG=os.environ.get('FFMPEG') or shutil.which('ffmpeg')
 
@@ -41,6 +76,34 @@ def write(path,obj):
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)
+
+def delete_preset(preset_id):
+    if not isinstance(preset_id,str) or not preset_id or len(preset_id)>64:
+        raise ValueError('Choose a style to delete.')
+    with LOCK:
+        items=read(DATA/'presets.json',STARTERS)
+        remaining=[item for item in items if item.get('id')!=preset_id]
+        if len(remaining)==len(items): raise ValueError('Style not found. Reload the page and try again.')
+        write(DATA/'presets.json',remaining)
+    return dict(deleted=preset_id)
+
+def available_fonts():
+    known={}
+    for item in read(DATA/'presets.json',STARTERS):
+        if item.get('fontFile'): known[item['fontFile']]=item.get('fontFamily','')
+    for file in (DATA/'projects').glob('*.json'):
+        item=read(file)
+        styles=[item.get('style',{})]+[cue.get('style',{}) for cue in item.get('captions',[])]
+        for style in styles:
+            if style.get('fontFile'): known[style['fontFile']]=style.get('fontFamily','')
+    files={p.name for p in (DATA/'fonts').iterdir() if p.suffix.lower() in ('.ttf','.otf')}
+    uploaded=[]
+    for filename in sorted(files|set(known)):
+        if not re.fullmatch(r'[a-f0-9]{32}\.(?:ttf|otf)',filename): continue
+        path=DATA/'fonts'/filename
+        family=(font_family_from_file(path) if path.exists() else None) or known.get(filename) or 'Uploaded font'
+        uploaded.append(dict(file=filename,family=family))
+    return dict(system=system_font_families(),uploaded=uploaded)
 
 def local_file(path):
     return STORE.download(path) if STORE else path
@@ -89,8 +152,10 @@ def export_job(p, update):
     if not HAS_ASS: raise ValueError('FFmpeg with libass is required. See README setup instructions, then restart the app.')
     rows=captions(p['captions']); style=preset(p['style'])
     if not rows: raise ValueError('Add or import captions before exporting')
-    if style['fontFile']:
-        font=DATA/'fonts'/style['fontFile']
+    font_files={style['fontFile']} if style['fontFile'] else set()
+    font_files.update(c.get('style',{}).get('fontFile') for c in rows if c.get('style',{}).get('fontFile'))
+    for filename in font_files:
+        font=DATA/'fonts'/filename
         try: local_file(font)
         except Exception: raise ValueError('Custom font missing. Upload it again, or choose Use system font.')
         if not font.exists(): raise ValueError('Custom font missing. Upload it again, or choose Use system font.')
@@ -163,8 +228,11 @@ class Handler(BaseHTTPRequestHandler):
         host=self.headers.get('Host','').lower()
         allowed={f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'}
         if REMOTE_HOST: allowed.update({REMOTE_HOST,f'{REMOTE_HOST}:443'})
+        sharing=share_session()
+        shared=bool(sharing and host in (sharing['host'],sharing['host']+':443'))
+        if shared: allowed.update({sharing['host'],sharing['host']+':443'})
         if host not in allowed: raise ValueError('Invalid host; open the localhost or configured HTTPS URL')
-        if STORE:
+        if STORE or shared:
             auth=self.headers.get('Authorization','')
             try:
                 scheme, encoded=auth.split(' ',1)
@@ -172,8 +240,10 @@ class Handler(BaseHTTPRequestHandler):
                 username,password=credentials.split(':',1)
             except (ValueError,UnicodeError,binascii.Error):
                 raise AuthenticationRequired
-            if scheme.lower()!='basic' or not (hmac.compare_digest(username,os.environ.get('CAPTION_SITE_USER',''))
-                                                    and hmac.compare_digest(password,os.environ.get('CAPTION_SITE_PASSWORD',''))):
+            expected_user=os.environ.get('CAPTION_SITE_USER','') if STORE else sharing['username']
+            expected_password=os.environ.get('CAPTION_SITE_PASSWORD','') if STORE else sharing['password']
+            if scheme.lower()!='basic' or not (hmac.compare_digest(username,expected_user)
+                                                    and hmac.compare_digest(password,expected_password)):
                 raise AuthenticationRequired
         if mutation and self.headers.get('X-Studio-Token')!=TOKEN: raise ValueError('Session expired. Reload the page.')
     def send_auth(self):
@@ -182,17 +252,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control','no-store')
         self.send_header('Content-Length','0')
         self.end_headers()
+    def send_health(self):
+        raw=b'<!doctype html><meta http-equiv="refresh" content="0;url=/app"><a href="/app">Open Caption Studio</a>'
+        self.send_response(200)
+        self.send_header('Content-Type','text/html; charset=utf-8')
+        self.send_header('Content-Length',str(len(raw)))
+        self.send_header('Cache-Control','no-store')
+        self.end_headers()
+        self.wfile.write(raw)
     def do_GET(self):
         try:
-            self.guard(); path=urlparse(self.path).path
+            path=urlparse(self.path).path
+            if STORE and path=='/': return self.send_health()
+            self.guard()
             if path=='/api/state':
                 with LOCK:
                     presets=read(DATA/'presets.json',STARTERS)
-                    existing={p.get('id') for p in presets}
-                    presets+=[p for p in STARTERS if p['id'] not in existing]
                     presets=[dict(preset(p),id=p.get('id','')) for p in presets]
                     projects=[dict(id=p['id'],name=p['name'],updated=p.get('updated',0)) for p in [read(f) for f in (DATA/'projects').glob('*.json')]]
                 return self.send_json(dict(token=TOKEN,cloudStorage=bool(STORE),cloudReady=bool(CLOUD_KEY),cloudModel=CLOUD_MODEL,romanSpellings=read(DATA/'roman-spellings.json',{}),presets=presets,projects=sorted(projects,key=lambda p:-p['updated']),ffmpeg=HAS_ASS,whisper=importlib.util.find_spec('faster_whisper') is not None,roman=importlib.util.find_spec('uroman') is not None,defaults=DEFAULT,keywordRules=dict(stopwords=sorted(STOPWORDS),impactWords=sorted(IMPACT_WORDS))))
+            if path=='/api/fonts':
+                with LOCK: fonts=available_fonts()
+                return self.send_json(fonts)
             if path.startswith('/api/projects/'):
                 p=project(path.rsplit('/',1)[1]);p['style']=preset(p['style']);return self.send_json(p)
             if path.startswith('/api/jobs/'):
@@ -203,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 file=(DATA/path[len('/files/'):]).resolve()
                 if not file.is_relative_to(DATA) or file.suffix.lower() not in ['.mp4','.mov','.m4v','.webm','.mkv','.ttf','.otf','.srt']: raise ValueError('File unavailable')
             else:
-                file=(ROOT/'static'/('index.html' if path=='/' else path.lstrip('/'))).resolve()
+                file=(ROOT/'static'/('index.html' if path in ('/','/app') else path.lstrip('/'))).resolve()
                 if not file.is_relative_to(ROOT/'static'): raise ValueError('Invalid path')
             return self.send_file(file)
         except AuthenticationRequired: self.send_auth()
@@ -249,6 +330,8 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     items=read(DATA/'presets.json',STARTERS); items.append(p); write(DATA/'presets.json',items)
                 return self.send_json(p)
+            if path=='/api/delete-preset':
+                return self.send_json(delete_preset(body.get('id')))
             if path=='/api/import-style':
                 ext=Path(body['name']).suffix.lower()
                 if ext in ['.setting','.comp']:return self.send_json(import_fusion(body['text'],body['name']))
@@ -257,10 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(raw,dict) or not any(k in raw for k in ['fontFamily','fontSize','textColor']):raise ValueError('This JSON is not a Caption Studio preset. Lottie/After Effects JSON is not supported.')
                 return self.send_json(dict(source='json',candidates=[dict(node=raw.get('name','Imported style'),style=preset(raw),mapped=['Caption Studio style settings'],warnings=[])]))
             if path=='/api/cloud-key':
-                key=body.get('key','')
-                if not isinstance(key,str) or len(key)>256 or any(c.isspace() for c in key):raise ValueError('Invalid API key format.')
-                globals()['CLOUD_KEY']=key
-                return self.send_json(dict(ready=bool(key)))
+                return self.send_json(dict(ready=save_cloud_key(body.get('key',''))))
             if path=='/api/roman-spellings':
                 entries=validate_spellings(body.get('spellings',{}))
                 with LOCK:write(DATA/'roman-spellings.json',entries)
@@ -307,8 +387,9 @@ class Handler(BaseHTTPRequestHandler):
             if kind=='font':
                 with dest.open('rb') as f: signature=f.read(4)
                 if signature not in [b'\x00\x01\x00\x00',b'OTTO',b'true']: raise ValueError('Not a valid TTF/OTF font')
+                family=font_family_from_file(dest)
                 if STORE: STORE.upload(dest)
-                return dict(fontFile=filename,url='/files/fonts/'+filename)
+                return dict(fontFile=filename,fontFamily=family,url='/files/fonts/'+filename)
             width=int(query.get('width',['0'])[0]); height=int(query.get('height',['0'])[0]); duration=float(query.get('duration',['0'])[0])
             if not (1<=width<=16384 and 1<=height<=16384 and 0<duration<=86400): raise ValueError('Browser could not read this video; convert to H.264 MP4 first')
             p=dict(id=uid,name=Path(name).name,media=filename,width=width,height=height,duration=duration,captions=[],style=preset(STARTERS[0]))

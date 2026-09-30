@@ -53,6 +53,23 @@ def captions(items):
         if end <= start: raise ValueError('Caption end must be after start')
         if not text or len(text)>4000: raise ValueError('Caption text must contain 1–4000 characters')
         row=dict(start=start,end=end,text=text)
+        if item.get('style'):
+            raw=item['style']
+            if not isinstance(raw,dict): raise ValueError('Invalid caption style')
+            own={}
+            if 'fontSize' in raw: own['fontSize']=int(number(raw['fontSize'],10,200))
+            if 'fontFamily' in raw:
+                family=str(raw['fontFamily']).strip()
+                if not family or len(family)>100 or any(c in family for c in ',\n\r{}\\'):
+                    raise ValueError('Invalid caption font')
+                own['fontFamily']=family
+            if 'fontFile' in raw:
+                file=str(raw['fontFile'])
+                if not re.fullmatch(r'[a-f0-9]{32}\.(?:ttf|otf)',file):raise ValueError('Invalid caption font file')
+                own['fontFile']=file
+            for axis in ('x','y'):
+                if axis in raw: own[axis]=number(raw[axis],0,100)
+            if own:row['style']=own
         if 'emphasisWord' in item:
             choice=item['emphasisWord']
             if not isinstance(choice,int) or not -1<=choice<len(text.split()):raise ValueError('Main-word selection is out of range')
@@ -132,6 +149,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 '''
     events=[]
     for c in rows:
+        own=c.get('style',{})
+        cp=dict(p,**own)
+        custom_pos=''
+        if 'x' in own or 'y' in own:
+            default_y=540 if p['position']=='middle' else my if p['position']=='top' else h-my
+            x=round(w*own.get('x',50)/100)
+            y=round(h*own.get('y',default_y/h*100)/100)
+            custom_pos=f'\\an5\\pos({x},{y})'
+        cue_tags=''
+        if 'fontFamily' in own:cue_tags+='\\fn'+cp['fontFamily']
+        if 'fontSize' in own:cue_tags+='\\fs'+str(cp['fontSize'])
+        cue_tags+=custom_pos
         words=word_times(c)
         selected=choose_keyword(c) if p['emphasis'] else -1
         groups=keyword_lines(len(words),selected,p['maxWords'],p['emphasisOwnLine'] and selected>=0)
@@ -145,14 +174,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 ink=p['highlightColor'] if active else p['emphasisColor'] if i==selected else p['textColor']
                 tags='\\c'+color(ink)+'&'
                 if i==selected:
-                    tags+='\\fs'+str(round(p['fontSize']*p['emphasisScale']))
+                    tags+='\\fs'+str(round(cp['fontSize']*p['emphasisScale']))
                     if p['emphasisFontFamily']:tags+='\\fn'+p['emphasisFontFamily']
                     if p['emphasisItalic']:tags+='\\i1'
-                reset='\\fs'+str(p['fontSize'])+'\\fn'+p['fontFamily']+'\\i0\\c'+color(p['textColor'])+'&'
+                reset='\\fs'+str(cp['fontSize'])+'\\fn'+cp['fontFamily']+'\\i0\\c'+color(p['textColor'])+'&'
                 t='{'+tags+'}'+t+'{'+reset+'}'
                 pieces.append(('\\N' if i and i in line_starts else ' ' if i else '')+t)
             body=''.join(pieces)
             if p['animation']=='fade': body='{\\fad(120,120)}'+body
+            if cue_tags:body='{'+cue_tags+'}'+body
             if p['background']:
                 events.append(f'Dialogue: 0,{clock(a,True)},{clock(b,True)},Box,,0,0,0,,{body}')
             events.append(f'Dialogue: 1,{clock(a,True)},{clock(b,True)},Default,,0,0,0,,{body}')
